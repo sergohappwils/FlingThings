@@ -69,6 +69,11 @@ local OriginalExplodeFn = ExplosionMaker.Explode
 local OriginalRaycastFn = RaycastModule.RaycastFromCam
 
 local LastSafeCFrame: CFrame? = nil
+local SafeAntiGrabCFrame: CFrame? = nil
+local AntiGrabGraceUntil: number = 0
+local AntiGrabAnchorUntil: number = 0
+local WasAnchoredByAntiGrab: boolean = false
+
 local ActiveGrabTarget: BasePart? = nil
 local CustomGrabDistance: number = 20
 local SilentAimCandidate: BasePart? = nil
@@ -469,7 +474,86 @@ local function UpdateStopVelocityProtection(char: Model?)
 	end
 end
 
--- 100% Pure Luau Reach Update (Zero getconnections / debug.setupvalue crashes)
+-- Zeroes velocity on all limbs of LocalPlayer's character to block fast camera-flick flings
+local function ZeroCharacterVelocity(char: Model?)
+	if not char then
+		return
+	end
+	for _, part in ipairs(char:GetChildren()) do
+		if part:IsA("BasePart") then
+			part.AssemblyLinearVelocity = Vector3.zero
+			part.AssemblyAngularVelocity = Vector3.zero
+			part.Velocity = Vector3.zero
+			part.RotVelocity = Vector3.zero
+		end
+	end
+end
+
+-- Breaks enemy GrabParts welds targeting LocalPlayer immediately
+local function BreakEnemyGrabParts(grabPartsModel: Instance): boolean
+	local char = GetCharacter()
+	if not char or not grabPartsModel or grabPartsModel.Parent == Workspace then
+		return false
+	end
+	local gp = grabPartsModel:FindFirstChild("GrabPart")
+	local wc = gp and gp:FindFirstChild("WeldConstraint") :: WeldConstraint?
+	if wc and wc.Part1 and wc.Part1:IsDescendantOf(char) then
+		wc.Enabled = false
+		wc.Part1 = nil
+		pcall(function()
+			grabPartsModel:Destroy()
+		end)
+		return true
+	end
+	return false
+end
+
+-- Triggers instant anti-fling anchor + struggle burst when grabbed
+local function TriggerAntiGrabDefense()
+	local now = os.clock()
+	AntiGrabGraceUntil = now + 0.65
+	AntiGrabAnchorUntil = now + 0.22
+
+	local char = GetCharacter()
+	local root = GetRootPart()
+	local hum = GetHumanoid()
+	local cam = Workspace.CurrentCamera
+
+	ZeroCharacterVelocity(char)
+
+	if root then
+		if SafeAntiGrabCFrame then
+			root.CFrame = SafeAntiGrabCFrame
+		end
+		root.Anchored = true
+		WasAnchoredByAntiGrab = true
+	end
+
+	for _ = 1, 6 do
+		Struggle:FireServer()
+	end
+
+	if root and cam and Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value then
+		SetNetworkOwner:FireServer(root, cam.CFrame)
+	end
+
+	if hum then
+		hum.Sit = false
+		hum.AutoRotate = true
+		hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		local ragVal = hum:FindFirstChild("Ragdolled")
+		if ragVal and ragVal:IsA("BoolValue") then
+			ragVal.Value = false
+		end
+	end
+
+	local ragScript = char and char:FindFirstChild("RagdollPlayerCharacter")
+	local unragEvent = ragScript and ragScript:FindFirstChild("UnragdollThisCharacter")
+	if unragEvent and unragEvent:IsA("BindableEvent") then
+		unragEvent:Fire()
+	end
+end
+
 local function ApplyCustomReach(reachStuds: number)
 	local currentReachVal = LocalPlayer:FindFirstChild("CurrentReach")
 	local defaultReachVal = LocalPlayer:FindFirstChild("DefaultReach")
@@ -810,12 +894,19 @@ local AntiGrabBox = Tabs.Defense:AddLeftGroupbox("Anti-Grab & Ownership")
 local AntiHazardBox = Tabs.Defense:AddRightGroupbox("Anti-Kick & Hazards")
 local AntiPerfBox = Tabs.Defense:AddLeftGroupbox("Anti-Lag & Visibility")
 
-RegisterTooltip("Anti Grab", "Automatically spams Struggle, unragdolls your character, and breaks enemy GrabParts welded to you.")
+RegisterTooltip("Anti Grab", "Anchors during grabs, breaks enemy GrabParts welds, spams Struggle, and strips post-grab throw velocity across all limbs.")
 AntiGrabBox:AddToggle("AntiGrab", {
 	Text = "Anti Grab",
 	Default = false,
-	Callback = function()
+	Callback = function(val)
 		UpdateStopVelocityProtection(GetCharacter())
+		if not val and WasAnchoredByAntiGrab then
+			local root = GetRootPart()
+			if root then
+				root.Anchored = false
+			end
+			WasAnchoredByAntiGrab = false
+		end
 	end,
 })
 
@@ -1427,6 +1518,9 @@ end
 -- ============================================================================
 
 AddConnection(LocalPlayer.CharacterAdded:Connect(function(newChar)
+	WasAnchoredByAntiGrab = false
+	AntiGrabGraceUntil = 0
+	AntiGrabAnchorUntil = 0
 	task.wait(0.5)
 	UpdateStopVelocityProtection(newChar)
 	if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value then
@@ -1436,9 +1530,56 @@ AddConnection(LocalPlayer.CharacterAdded:Connect(function(newChar)
 end))
 UpdateStopVelocityProtection(GetCharacter())
 
+-- Instant Intercept when anyone fires CreateGrabLine on any part of LocalPlayer's character
+AddConnection(CreateGrabLine.OnClientEvent:Connect(function(grabber, grabbedPart)
+	if grabber ~= LocalPlayer and grabbedPart and typeof(grabbedPart) == "Instance" then
+		local char = GetCharacter()
+		if char and grabbedPart:IsDescendantOf(char) then
+			if Toggles.AutoReset and Toggles.AutoReset.Value then
+				local hum = GetHumanoid()
+				if hum then
+					hum.Health = 0
+				end
+				return
+			end
+			if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value) then
+				TriggerAntiGrabDefense()
+				task.defer(function()
+					if grabber.Character then
+						local theirGrab = grabber.Character:FindFirstChild("GrabParts")
+						if theirGrab then
+							BreakEnemyGrabParts(theirGrab)
+						end
+					end
+				end)
+			end
+		end
+	end
+end))
+
 AddConnection(Workspace.DescendantAdded:Connect(function(inst)
 	if inst:IsA("BasePart") then
 		ApplySinglePartProtection(inst)
+	elseif inst.Name == "PartOwner" then
+		local char = GetCharacter()
+		if char and inst:IsDescendantOf(char) then
+			if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value) then
+				TriggerAntiGrabDefense()
+				task.defer(function()
+					if inst and inst.Parent then
+						inst:Destroy()
+					end
+				end)
+			end
+		end
+	elseif inst.Name == "GrabParts" and inst.Parent ~= Workspace then
+		if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value) then
+			task.defer(function()
+				if BreakEnemyGrabParts(inst) then
+					TriggerAntiGrabDefense()
+				end
+			end)
+		end
 	elseif inst.Name == "MushroomPoisonEffects" and Toggles.AntiPoison and Toggles.AntiPoison.Value then
 		task.defer(function()
 			inst:Destroy()
@@ -1476,7 +1617,6 @@ AddConnection(Workspace.ChildAdded:Connect(function(child)
 			local target = weld.Part1
 			ActiveGrabTarget = target
 
-			-- Prevent baseplate / anchored map parts from ever getting velocity
 			if target and target.Anchored then
 				target.AssemblyLinearVelocity = Vector3.zero
 				target.AssemblyAngularVelocity = Vector3.zero
@@ -1570,26 +1710,65 @@ if IsHeldValue then
 				end
 				return
 			end
-			if Toggles.AntiGrab and Toggles.AntiGrab.Value then
-				local root = GetRootPart()
-				local savedCF = root and root.CFrame
-				for _ = 1, 5 do
-					Struggle:FireServer()
-				end
-				if root and savedCF then
-					root.Anchored = true
-					root.AssemblyLinearVelocity = Vector3.zero
-					root.CFrame = savedCF
-					task.delay(0.06, function()
-						if root then
-							root.Anchored = false
-						end
-					end)
-				end
+			if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value) then
+				TriggerAntiGrabDefense()
+			end
+		else
+			-- Extend protection window when grab is released so fast camera-flick throws are absorbed
+			if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value) then
+				local now = os.clock()
+				AntiGrabGraceUntil = math.max(AntiGrabGraceUntil, now + 0.65)
+				AntiGrabAnchorUntil = math.max(AntiGrabAnchorUntil, now + 0.18)
+				ZeroCharacterVelocity(GetCharacter())
 			end
 		end
 	end))
 end
+
+-- Pre-Physics & Post-Physics Anti-Fling Shield (Stops fast grab camera-flicks before & after physics)
+local function EnforceAntiGrabPhysicsShield()
+	if not ((Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value)) then
+		return
+	end
+
+	local char = GetCharacter()
+	local root = GetRootPart()
+	if not (char and root) then
+		return
+	end
+
+	local now = os.clock()
+	local isHeld = IsHeldValue and IsHeldValue.Value
+	local head = char:FindFirstChild("Head")
+	local partOwner = head and head:FindFirstChild("PartOwner")
+
+	if isHeld or partOwner then
+		AntiGrabGraceUntil = now + 0.65
+		AntiGrabAnchorUntil = now + 0.22
+	end
+
+	if now < AntiGrabGraceUntil then
+		ZeroCharacterVelocity(char)
+		if SafeAntiGrabCFrame and (root.Position - SafeAntiGrabCFrame.Position).Magnitude > 5 then
+			root.CFrame = SafeAntiGrabCFrame
+		end
+	end
+
+	if isHeld or partOwner or now < AntiGrabAnchorUntil then
+		root.Anchored = true
+		WasAnchoredByAntiGrab = true
+		if SafeAntiGrabCFrame then
+			root.CFrame = SafeAntiGrabCFrame
+		end
+	elseif WasAnchoredByAntiGrab then
+		root.Anchored = false
+		WasAnchoredByAntiGrab = false
+		ZeroCharacterVelocity(char)
+	end
+end
+
+AddConnection(RunService.Stepped:Connect(EnforceAntiGrabPhysicsShield))
+AddConnection(RunService.Heartbeat:Connect(EnforceAntiGrabPhysicsShield))
 
 -- Main RenderStepped Loop
 local OrbitAngle = 0
@@ -1711,15 +1890,34 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
+	-- Frame-Perfect Enemy Grab Weld Breaker & CFrame Tracker
+	if char and ((Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value)) then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= LocalPlayer and plr.Character then
+				local theirGrab = plr.Character:FindFirstChild("GrabParts")
+				if theirGrab and BreakEnemyGrabParts(theirGrab) then
+					TriggerAntiGrabDefense()
+				end
+			end
+		end
+	end
+
+	local now = os.clock()
 	local isHeld = IsHeldValue and IsHeldValue.Value
 	local head = char and char:FindFirstChild("Head")
 	local partOwner = head and head:FindFirstChild("PartOwner")
 
-	if isHeld or partOwner then
+	if not isHeld and not partOwner and now >= AntiGrabGraceUntil and root then
+		SafeAntiGrabCFrame = root.CFrame
+	end
+
+	if isHeld or partOwner or now < AntiGrabGraceUntil then
 		if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value) then
 			Struggle:FireServer()
 			if hum then
 				hum.Sit = false
+				hum.AutoRotate = true
+				hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 				local ragVal = hum:FindFirstChild("Ragdolled")
 				if ragVal and ragVal:IsA("BoolValue") then
 					ragVal.Value = false
@@ -1730,9 +1928,8 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 			if unragEvent and unragEvent:IsA("BindableEvent") then
 				unragEvent:Fire()
 			end
+			ZeroCharacterVelocity(char)
 			if root then
-				root.AssemblyLinearVelocity = Vector3.zero
-				root.AssemblyAngularVelocity = Vector3.zero
 				if Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value and cam then
 					SetNetworkOwner:FireServer(root, cam.CFrame)
 				end
@@ -1742,6 +1939,8 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 			end
 		end
 	end
+
+	EnforceAntiGrabPhysicsShield()
 
 	-- Active Grab Modifiers (Strictly ignores Anchored / Baseplate / Map parts so you never get velocited!)
 	local grabParts = Workspace:FindFirstChild("GrabParts")
@@ -1839,22 +2038,6 @@ task.spawn(function()
 			local minFPS = (Options.AutoAntiLagFPS and Options.AutoAntiLagFPS.Value) or 35
 			if FPSCounter < minFPS then
 				RunAntiLagCleanup()
-			end
-		end
-
-		if char and ((Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value)) then
-			for _, plr in ipairs(Players:GetPlayers()) do
-				if plr ~= LocalPlayer and plr.Character then
-					local theirGrab = plr.Character:FindFirstChild("GrabParts")
-					if theirGrab then
-						local gp = theirGrab:FindFirstChild("GrabPart")
-						local wc = gp and gp:FindFirstChild("WeldConstraint")
-						if wc and wc.Part1 and wc.Part1:IsDescendantOf(char) then
-							wc.Part1 = nil
-							theirGrab:Destroy()
-						end
-					end
-				end
 			end
 		end
 
@@ -2044,6 +2227,10 @@ Env.FTAP_Obsidian_Cleanup = function()
 
 	local char = GetCharacter()
 	if char then
+		local root = GetRootPart()
+		if root and WasAnchoredByAntiGrab then
+			root.Anchored = false
+		end
 		local stopVel = char:FindFirstChild("StopVelocity")
 		if stopVel and stopVel:IsA("LocalScript") then
 			stopVel.Disabled = false
