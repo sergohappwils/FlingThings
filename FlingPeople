@@ -3,6 +3,7 @@ local cloneref = cloneref or function(inst)
 	return inst
 end
 
+local GuiService = cloneref(game:GetService("GuiService"))
 local Players = cloneref(game:GetService("Players"))
 local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
 local RunService = cloneref(game:GetService("RunService"))
@@ -43,14 +44,15 @@ local CharacterEvents = ReplicatedStorage:WaitForChild("CharacterEvents")
 local Struggle = CharacterEvents:WaitForChild("Struggle")
 local RagdollRemote = CharacterEvents:FindFirstChild("RagdollRemote")
 
+local GameCorrectionEvents = ReplicatedStorage:FindFirstChild("GameCorrectionEvents")
+local TeleportToGround = GameCorrectionEvents and GameCorrectionEvents:FindFirstChild("TeleportToGround")
+local StopAllVelocity = GameCorrectionEvents and GameCorrectionEvents:FindFirstChild("StopAllVelocity")
+
 local MenuToys = ReplicatedStorage:WaitForChild("MenuToys")
 local SpawnToyRF = MenuToys:WaitForChild("SpawnToyRemoteFunction")
 local BuyToyRF = MenuToys:WaitForChild("BuyToyRemoteFunction")
 local DestroyToyRE = MenuToys:WaitForChild("DestroyToy")
 local MenuToysData = require(MenuToys:WaitForChild("MenuToysData"))
-
-local GamepassEvents = ReplicatedStorage:WaitForChild("GamepassEvents")
-local FurtherReachNotifier = GamepassEvents:WaitForChild("FurtherReachBoughtNotifier")
 
 local DataEvents = ReplicatedStorage:WaitForChild("DataEvents")
 local UpdateLineColorsEvent = DataEvents:WaitForChild("UpdateLineColorsEvent")
@@ -71,7 +73,9 @@ local OriginalExplodeFn = ExplosionMaker.Explode
 local OriginalRaycastFn = RaycastModule.RaycastFromCam
 
 local LastSafeCFrame: CFrame? = nil
+local LastUnheldCFrame: CFrame? = nil
 local ActiveGrabTarget: BasePart? = nil
+local CustomGrabDistance: number = 20
 local SilentAimCandidate: BasePart? = nil
 local GucciVehicle: Model? = nil
 local RainbowHue = 0
@@ -124,13 +128,13 @@ end
 local AllToyNames = MenuToysData.GetAllToysSortedByName()
 
 -- ============================================================================
--- SILENT AIM OVERLAY (RED = READY TO GRAB, GREEN = GRABBING)
+-- OVERLAY GUI (SILENT AIM FOV + PERSISTENT HOVER TOOLTIP)
 -- ============================================================================
 local OverlayGui = Instance.new("ScreenGui")
 OverlayGui.Name = "FTAP_SilentAimOverlay"
 OverlayGui.ResetOnSpawn = false
 OverlayGui.IgnoreGuiInset = true
-OverlayGui.DisplayOrder = 999
+OverlayGui.DisplayOrder = 9999
 OverlayGui.Parent = (gethui and gethui()) or cloneref(game:GetService("CoreGui"))
 
 local FOVCircleFrame = Instance.new("Frame")
@@ -178,6 +182,55 @@ TargetHighlight.FillTransparency = 0.45
 TargetHighlight.OutlineTransparency = 0
 TargetHighlight.Enabled = false
 TargetHighlight.Parent = OverlayGui
+
+-- Custom Persistent Hover Tooltip Box (Never stops working over time)
+local HoverTooltipFrame = Instance.new("Frame")
+HoverTooltipFrame.Name = "FTAP_HoverTooltip"
+HoverTooltipFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+HoverTooltipFrame.BackgroundTransparency = 0.04
+HoverTooltipFrame.BorderSizePixel = 0
+HoverTooltipFrame.Size = UDim2.fromOffset(270, 56)
+HoverTooltipFrame.Visible = false
+HoverTooltipFrame.ZIndex = 10000
+HoverTooltipFrame.Parent = OverlayGui
+
+local HoverCorner = Instance.new("UICorner")
+HoverCorner.CornerRadius = UDim.new(0, 6)
+HoverCorner.Parent = HoverTooltipFrame
+
+local HoverStroke = Instance.new("UIStroke")
+HoverStroke.Color = Color3.fromRGB(125, 85, 255)
+HoverStroke.Thickness = 1.2
+HoverStroke.Transparency = 0.2
+HoverStroke.Parent = HoverTooltipFrame
+
+local HoverTitleLabel = Instance.new("TextLabel")
+HoverTitleLabel.Name = "Title"
+HoverTitleLabel.BackgroundTransparency = 1
+HoverTitleLabel.Position = UDim2.fromOffset(10, 6)
+HoverTitleLabel.Size = UDim2.new(1, -20, 0, 16)
+HoverTitleLabel.Font = Enum.Font.GothamBold
+HoverTitleLabel.TextSize = 13
+HoverTitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+HoverTitleLabel.TextColor3 = Color3.fromRGB(170, 140, 255)
+HoverTitleLabel.Text = ""
+HoverTitleLabel.ZIndex = 10001
+HoverTitleLabel.Parent = HoverTooltipFrame
+
+local HoverDescLabel = Instance.new("TextLabel")
+HoverDescLabel.Name = "Description"
+HoverDescLabel.BackgroundTransparency = 1
+HoverDescLabel.Position = UDim2.fromOffset(10, 24)
+HoverDescLabel.Size = UDim2.new(1, -20, 1, -30)
+HoverDescLabel.Font = Enum.Font.Gotham
+HoverDescLabel.TextSize = 12
+HoverDescLabel.TextWrapped = true
+HoverDescLabel.TextXAlignment = Enum.TextXAlignment.Left
+HoverDescLabel.TextYAlignment = Enum.TextYAlignment.Top
+HoverDescLabel.TextColor3 = Color3.fromRGB(230, 230, 235)
+HoverDescLabel.Text = ""
+HoverDescLabel.ZIndex = 10001
+HoverDescLabel.Parent = HoverTooltipFrame
 
 local COLOR_RED = Color3.fromRGB(255, 55, 55)
 local COLOR_GREEN = Color3.fromRGB(55, 255, 110)
@@ -278,7 +331,7 @@ RaycastModule.RaycastFromCam = function(player, reach)
 end
 
 -- ============================================================================
--- HAZARD CACHE & PROTECTION FUNCTIONS
+-- HAZARD CACHE & ANTI-PULLBACK / ANTI-KICK FUNCTIONS
 -- ============================================================================
 local function ApplySinglePartProtection(part: BasePart)
 	local name = part.Name
@@ -309,11 +362,14 @@ local function ApplySinglePartProtection(part: BasePart)
 			part.CanQuery = false
 			part.CanCollide = false
 		end
-	elseif name == "PlotBarrier" then
+	elseif name == "PlotBarrier" or name == "PlotArea" then
 		HazardCache.PlotBarrier[part] = true
 		if Toggles.AntiPlotBarrier and Toggles.AntiPlotBarrier.Value then
-			part.CanCollide = false
+			if name == "PlotBarrier" then
+				part.CanCollide = false
+			end
 			part.CanTouch = false
+			part.CanQuery = false
 		end
 	elseif name == "LeftDetector" or name == "RightDetector" then
 		if parent and parent.Name == "CreatureBlobman" then
@@ -360,7 +416,8 @@ local function SetCategoryPartsState(category: string, disableTouch: boolean, di
 	for part in pairs(bucket) do
 		if part and part.Parent then
 			part.CanTouch = not disableTouch
-			if disableCollide ~= nil then
+			part.CanQuery = not disableTouch
+			if disableCollide ~= nil and part.Name ~= "PlotArea" then
 				part.CanCollide = not disableCollide
 			end
 		else
@@ -391,48 +448,89 @@ ExplosionMaker.Explode = function(bombTable, pos)
 	return OriginalExplodeFn(bombTable, pos)
 end
 
+-- Permanently neutralizes StopVelocity & TeleportToGround rubber-banding
 local function UpdateStopVelocityProtection(char: Model?)
+	local shouldProtect = (Toggles.AntiKick and Toggles.AntiKick.Value) or (Toggles.AntiGrab and Toggles.AntiGrab.Value)
+
+	if shouldProtect and getconnections then
+		pcall(function()
+			if TeleportToGround then
+				for _, conn in ipairs(getconnections(TeleportToGround.OnClientEvent)) do
+					if conn.Disable then
+						conn:Disable()
+					elseif conn.Disconnect then
+						conn:Disconnect()
+					end
+				end
+			end
+			if StopAllVelocity then
+				for _, conn in ipairs(getconnections(StopAllVelocity.OnClientEvent)) do
+					if conn.Disable then
+						conn:Disable()
+					elseif conn.Disconnect then
+						conn:Disconnect()
+					end
+				end
+			end
+		end)
+	end
+
 	if not char then
 		return
 	end
+
 	local stopVelScript = char:FindFirstChild("StopVelocity")
 	if stopVelScript and stopVelScript:IsA("LocalScript") then
-		local shouldDisable = (Toggles.AntiKick and Toggles.AntiKick.Value) or (Toggles.AntiGrab and Toggles.AntiGrab.Value)
-		stopVelScript.Disabled = if shouldDisable then true else false
+		if shouldProtect then
+			stopVelScript.Disabled = true
+			pcall(function()
+				stopVelScript:Destroy()
+			end)
+		end
 	end
+
 	local poisonScript = char:FindFirstChild("PoisonBallSpawner")
 	if poisonScript and poisonScript:IsA("LocalScript") and Toggles.AntiPoison and Toggles.AntiPoison.Value then
 		poisonScript.Disabled = true
 	end
 end
 
--- Crash-Safe Free Gamepass / Reach Update (No conn:Fire() calls)
-local function ApplyCustomReach(reachStuds: number)
-	pcall(function()
-		local currentReachVal = LocalPlayer:FindFirstChild("CurrentReach")
-		local defaultReachVal = LocalPlayer:FindFirstChild("DefaultReach")
-		if currentReachVal and currentReachVal:IsA("NumberValue") then
-			currentReachVal.Value = reachStuds
-		end
-		if defaultReachVal and defaultReachVal:IsA("NumberValue") then
-			defaultReachVal.Value = reachStuds
-		end
+-- Breaks enemy GrabParts welds before they can pull LocalPlayer backward
+local function BreakEnemyGrabOnMe(grabPartsModel: Instance)
+	local char = GetCharacter()
+	if not char or not grabPartsModel or grabPartsModel.Parent == Workspace then
+		return false
+	end
+	local gp = grabPartsModel:FindFirstChild("GrabPart")
+	local wc = gp and gp:FindFirstChild("WeldConstraint") :: WeldConstraint?
+	if wc and wc.Part1 and wc.Part1:IsDescendantOf(char) then
+		wc.Enabled = false
+		wc.Part1 = nil
+		pcall(function()
+			grabPartsModel:Destroy()
+		end)
+		return true
+	end
+	return false
+end
 
-		if getconnections and debug and debug.getupvalue and debug.setupvalue then
-			local isc = iscclosure or function()
-				return false
-			end
-			for _, conn in ipairs(getconnections(FurtherReachNotifier.OnClientEvent)) do
-				local fn = conn.Function
-				if fn and not isc(fn) then
-					local ok, upval = pcall(debug.getupvalue, fn, 1)
-					if ok and type(upval) == "number" then
-						pcall(debug.setupvalue, fn, 1, reachStuds)
-					end
-				end
-			end
-		end
-	end)
+local function ApplyCustomReach(reachStuds: number)
+	local currentReachVal = LocalPlayer:FindFirstChild("CurrentReach")
+	local defaultReachVal = LocalPlayer:FindFirstChild("DefaultReach")
+	if currentReachVal and currentReachVal:IsA("NumberValue") then
+		currentReachVal.Value = reachStuds
+	end
+	if defaultReachVal and defaultReachVal:IsA("NumberValue") then
+		defaultReachVal.Value = reachStuds
+	end
+
+	local fartherReachVal = LocalPlayer:FindFirstChild("FartherReach")
+	if not fartherReachVal then
+		fartherReachVal = Instance.new("BoolValue")
+		fartherReachVal.Name = "FartherReach"
+		fartherReachVal.Parent = LocalPlayer
+	end
+	fartherReachVal.Value = (Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value) or false
 end
 
 local function SpawnWoodPlank()
@@ -494,7 +592,16 @@ local function EnableGucciAntiGrab(mode: string)
 				SpawnToyRF:InvokeServer(toyName, root.CFrame, orientVec)
 			end)
 			if toysFolder then
-				vehicleModel = toysFolder:WaitForChild(toyName, 3)
+				vehicleModel = toysFolder:WaitForChild(toyName, 1.5)
+			end
+		end
+
+		-- Fallback to map's free Farm.TractorGreen if player doesn't own the toy
+		if not vehicleModel then
+			local farmFolder = Workspace:FindFirstChild("Farm")
+			local freeTractor = farmFolder and farmFolder:FindFirstChild("TractorGreen")
+			if freeTractor then
+				vehicleModel = freeTractor
 			end
 		end
 
@@ -512,11 +619,11 @@ local function EnableGucciAntiGrab(mode: string)
 					end
 				end
 				vSeat:Sit(hum)
-				task.wait(0.12)
+				task.wait(0.1)
 				if RagdollRemote then
 					RagdollRemote:FireServer(root, 0)
 				end
-				task.wait(0.08)
+				task.wait(0.06)
 				local seatWeld = vSeat:FindFirstChild("SeatWeld")
 				if seatWeld then
 					seatWeld:Destroy()
@@ -542,6 +649,16 @@ local function RunAntiLagCleanup()
 			char.GrabbingScript.LowQualityMode:Fire()
 		end
 	end)
+end
+
+-- ============================================================================
+-- PERSISTENT TOOLTIP REGISTRY
+-- ============================================================================
+local TooltipByText: { [string]: string } = {}
+local HoverTargets: { { Frame: GuiObject, Title: string, Tip: string } } = {}
+
+local function RegisterTooltip(title: string, tip: string)
+	TooltipByText[title] = tip
 end
 
 -- ============================================================================
@@ -572,6 +689,7 @@ local SilentAimBox = Tabs.GrabMods:AddLeftGroupbox("Silent Aim & Camera FOV")
 local GrabModifiersBox = Tabs.GrabMods:AddRightGroupbox("Grab Modifiers")
 local GrabPassBox = Tabs.GrabMods:AddLeftGroupbox("Gamepasses & Line")
 
+RegisterTooltip("Silent Aim Grab", "Automatically snaps your grab raycast to the closest player or toy inside the FOV circle (Red = Ready, Green = Grabbing).")
 SilentAimBox:AddToggle("SilentAimGrab", {
 	Text = "Silent Aim Grab",
 	Default = true,
@@ -584,6 +702,7 @@ SilentAimBox:AddToggle("SilentAimGrab", {
 	end,
 })
 
+RegisterTooltip("Show Silent Aim Circle", "Displays the on-screen FOV circle around your cursor.")
 SilentAimBox:AddToggle("ShowSilentAimCircle", {
 	Text = "Show Silent Aim Circle",
 	Default = true,
@@ -592,6 +711,7 @@ SilentAimBox:AddToggle("ShowSilentAimCircle", {
 	end,
 })
 
+RegisterTooltip("Silent Aim Radius", "Adjusts the pixel radius of the Silent Aim target detection circle.")
 SilentAimBox:AddSlider("SilentAimRadius", {
 	Text = "Silent Aim Radius",
 	Default = 150,
@@ -603,6 +723,7 @@ SilentAimBox:AddSlider("SilentAimRadius", {
 	end,
 })
 
+RegisterTooltip("Silent Aim Target", "Choose whether Silent Aim locks onto both players and unanchored toys, or players only.")
 SilentAimBox:AddDropdown("SilentAimPriority", {
 	Values = { "Players & Toys", "Players Only" },
 	Default = 1,
@@ -612,6 +733,7 @@ SilentAimBox:AddDropdown("SilentAimPriority", {
 
 SilentAimBox:AddDivider()
 
+RegisterTooltip("Camera FOV", "Changes your camera Field of View (default is 70).")
 SilentAimBox:AddSlider("CameraFOV", {
 	Text = "Camera FOV",
 	Default = 70,
@@ -626,6 +748,7 @@ SilentAimBox:AddSlider("CameraFOV", {
 	end,
 })
 
+RegisterTooltip("Reset FOV", "Resets your camera Field of View back to the default 70.")
 SilentAimBox:AddButton({
 	Text = "Reset FOV",
 	Func = function()
@@ -639,11 +762,13 @@ SilentAimBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Super Strength", "Launches grabbed players or items at extreme velocity when you release or throw them.")
 GrabModifiersBox:AddToggle("SuperStrength", {
 	Text = "Super Strength",
 	Default = false,
 })
 
+RegisterTooltip("Strength Power", "Sets the launch velocity applied when releasing a grabbed object with Super Strength.")
 GrabModifiersBox:AddSlider("StrengthPower", {
 	Text = "Strength Power",
 	Default = 850,
@@ -652,16 +777,19 @@ GrabModifiersBox:AddSlider("StrengthPower", {
 	Rounding = 0,
 })
 
+RegisterTooltip("Supersonic Grab", "Maxes out AlignPosition and AlignOrientation responsiveness and force on your GrabParts.")
 GrabModifiersBox:AddToggle("SupersonicGrab", {
 	Text = "Supersonic Grab",
 	Default = false,
 })
 
+RegisterTooltip("Spin Grab", "Rapidly spins the grabbed player or object while holding them.")
 GrabModifiersBox:AddToggle("SpinGrab", {
 	Text = "Spin Grab",
 	Default = false,
 })
 
+RegisterTooltip("Spin Speed", "Controls how fast Spin Grab rotates the grabbed target.")
 GrabModifiersBox:AddSlider("SpinGrabSpeed", {
 	Text = "Spin Speed",
 	Default = 15,
@@ -670,26 +798,31 @@ GrabModifiersBox:AddSlider("SpinGrabSpeed", {
 	Rounding = 0,
 })
 
+RegisterTooltip("Sky Grab", "Pulls the grabbed target 350 studs straight up into the sky.")
 GrabModifiersBox:AddToggle("SkyGrab", {
 	Text = "Sky Grab",
 	Default = false,
 })
 
+RegisterTooltip("Noclip Grab", "Disables collisions on the grabbed target so you can drag them through walls and floors.")
 GrabModifiersBox:AddToggle("NoclipGrab", {
 	Text = "Noclip Grab",
 	Default = false,
 })
 
+RegisterTooltip("Chaos Grab", "Violently jitters the grabbed target in random directions around your drag point.")
 GrabModifiersBox:AddToggle("ChaosGrab", {
 	Text = "Chaos Grab",
 	Default = false,
 })
 
+RegisterTooltip("Kill Grab", "Instantly claims network ownership and sends grabbed players into the void destroy height.")
 GrabModifiersBox:AddToggle("KillGrab", {
 	Text = "Kill Grab",
 	Default = false,
 })
 
+RegisterTooltip("Free Gamepass (Further Reach)", "Unlocks extended grab reach and mouse wheel scroll distance without needing the Farther Reach gamepass.")
 GrabPassBox:AddToggle("FreeFurtherReach", {
 	Text = "Free Gamepass (Further Reach)",
 	Default = false,
@@ -703,6 +836,7 @@ GrabPassBox:AddToggle("FreeFurtherReach", {
 	end,
 })
 
+RegisterTooltip("Custom Grab Reach", "Sets the maximum stud distance you can grab and scroll targets out to.")
 GrabPassBox:AddSlider("CustomReachSlider", {
 	Text = "Custom Grab Reach",
 	Default = 30,
@@ -716,6 +850,7 @@ GrabPassBox:AddSlider("CustomReachSlider", {
 	end,
 })
 
+RegisterTooltip("Rainbow Grab Beam", "Cycles your grab beam and ball color through a smooth rainbow gradient on the server.")
 GrabPassBox:AddToggle("RainbowLine", {
 	Text = "Rainbow Grab Beam",
 	Default = false,
@@ -728,6 +863,7 @@ local AntiGrabBox = Tabs.Defense:AddLeftGroupbox("Anti-Grab & Ownership")
 local AntiHazardBox = Tabs.Defense:AddRightGroupbox("Anti-Kick & Hazards")
 local AntiPerfBox = Tabs.Defense:AddLeftGroupbox("Anti-Lag & Visibility")
 
+RegisterTooltip("Anti Grab", "Instantly breaks enemy grab welds, spams Struggle, unragdolls you, and prevents being pulled back.")
 AntiGrabBox:AddToggle("AntiGrab", {
 	Text = "Anti Grab",
 	Default = false,
@@ -736,6 +872,7 @@ AntiGrabBox:AddToggle("AntiGrab", {
 	end,
 })
 
+RegisterTooltip("[GUCCHI] Anti Grab", "Desyncs your seat weld using Blobman or Tractor so other players cannot grab you.")
 AntiGrabBox:AddToggle("GucciAntiGrab", {
 	Text = "[GUCCHI] Anti Grab",
 	Default = false,
@@ -754,6 +891,7 @@ AntiGrabBox:AddToggle("GucciAntiGrab", {
 	end,
 })
 
+RegisterTooltip("Gucci Vehicle Mode", "Select which vehicle is used for [GUCCHI] Anti Grab (falls back to Farm Tractor if unowned).")
 AntiGrabBox:AddDropdown("GucciMode", {
 	Values = { "CreatureBlobman", "TractorGreen" },
 	Default = 1,
@@ -761,11 +899,13 @@ AntiGrabBox:AddDropdown("GucciMode", {
 	Text = "Gucci Vehicle Mode",
 })
 
+RegisterTooltip("Anti Network Ownership", "Continuously reclaims network ownership of your HumanoidRootPart when another player tries to hold you.")
 AntiGrabBox:AddToggle("AntiNetworkOwnership", {
 	Text = "Anti Network Ownership",
 	Default = false,
 })
 
+RegisterTooltip("Anti Blobman", "Disables touch detection on all CreatureBlobman LeftDetector and RightDetector grab hitboxes.")
 AntiGrabBox:AddToggle("AntiBlobman", {
 	Text = "Anti Blobman",
 	Default = false,
@@ -774,11 +914,13 @@ AntiGrabBox:AddToggle("AntiBlobman", {
 	end,
 })
 
+RegisterTooltip("Auto Reset", "Instantly resets your character the moment someone grabs you.")
 AntiGrabBox:AddToggle("AutoReset", {
 	Text = "Auto Reset",
 	Default = false,
 })
 
+RegisterTooltip("Anti Kick", "Destroys the StopVelocity script and disconnects TeleportToGround so the server cannot rubber-band you back.")
 AntiHazardBox:AddToggle("AntiKick", {
 	Text = "Anti Kick",
 	Default = false,
@@ -787,6 +929,7 @@ AntiHazardBox:AddToggle("AntiKick", {
 	end,
 })
 
+RegisterTooltip("Anti Plot Barrier", "Disables PlotBarrier collisions and PlotArea touch detection so you can walk freely into any house plot.")
 AntiHazardBox:AddToggle("AntiPlotBarrier", {
 	Text = "Anti Plot Barrier",
 	Default = false,
@@ -795,6 +938,7 @@ AntiHazardBox:AddToggle("AntiPlotBarrier", {
 	end,
 })
 
+RegisterTooltip("[Break PCLD] Anti Kick", "Disables CanTouch and CanQuery on all 29 PlayerCharacterLocationDetector anti-cheat zones.")
 AntiHazardBox:AddToggle("BreakPCLD", {
 	Text = "[Break PCLD] Anti Kick",
 	Default = false,
@@ -803,11 +947,13 @@ AntiHazardBox:AddToggle("BreakPCLD", {
 	end,
 })
 
+RegisterTooltip("Anti Explosion", "Prevents nearby bombs, balloons, and missiles from applying explosion impulse to your character.")
 AntiHazardBox:AddToggle("AntiExplosion", {
 	Text = "Anti Explosion",
 	Default = false,
 })
 
+RegisterTooltip("Anti Burn", "Disables FirePlayerPart touch hitboxes on campfires, ovens, and burning players.")
 AntiHazardBox:AddToggle("AntiBurn", {
 	Text = "Anti Burn",
 	Default = false,
@@ -816,11 +962,13 @@ AntiHazardBox:AddToggle("AntiBurn", {
 	end,
 })
 
+RegisterTooltip("Anti Void", "Teleports you back to your last safe ground position if you fall below Y = -120.")
 AntiHazardBox:AddToggle("AntiVoid", {
 	Text = "Anti Void",
 	Default = false,
 })
 
+RegisterTooltip("Anti Sticky", "Disables StickyPartsTouchDetection so cleavers, pickaxes, kunais, and shurikens cannot stick to you.")
 AntiHazardBox:AddToggle("AntiSticky", {
 	Text = "Anti Sticky",
 	Default = false,
@@ -833,6 +981,7 @@ AntiHazardBox:AddToggle("AntiSticky", {
 	end,
 })
 
+RegisterTooltip("Anti Snowball", "Disables collisions and touch events on snowballs so they cannot ragdoll you.")
 AntiHazardBox:AddToggle("AntiSnowball", {
 	Text = "Anti Snowball",
 	Default = false,
@@ -841,6 +990,7 @@ AntiHazardBox:AddToggle("AntiSnowball", {
 	end,
 })
 
+RegisterTooltip("Anti Banana", "Prevents banana peels from ragdolling or tripping your character.")
 AntiHazardBox:AddToggle("AntiBanana", {
 	Text = "Anti Banana",
 	Default = false,
@@ -849,7 +999,8 @@ AntiHazardBox:AddToggle("AntiBanana", {
 	end,
 })
 
-AntiHazardBox:AddToggle("AntiPaint", {
+RegisterTooltip("Anti Paint", "Disables PaintPlayerPart hitboxes on paint buckets, hot sauce, UFOs, and tesla coils.")
+AntiHazardBox:AddToggle("Anti Paint", {
 	Text = "Anti Paint",
 	Default = false,
 	Callback = function(val)
@@ -857,6 +1008,7 @@ AntiHazardBox:AddToggle("AntiPaint", {
 	end,
 })
 
+RegisterTooltip("Anti Poison", "Protects you from poison holes, factory poison containers, drips, and poison mushrooms.")
 AntiHazardBox:AddToggle("AntiPoison", {
 	Text = "Anti Poison",
 	Default = false,
@@ -866,6 +1018,7 @@ AntiHazardBox:AddToggle("AntiPoison", {
 	end,
 })
 
+RegisterTooltip("Anti Lag", "Fires the native LowQualityMode and DisableHitSounds events to boost FPS.")
 AntiPerfBox:AddToggle("AntiLag", {
 	Text = "Anti Lag",
 	Default = false,
@@ -876,11 +1029,13 @@ AntiPerfBox:AddToggle("AntiLag", {
 	end,
 })
 
+RegisterTooltip("Auto Anti Lag", "Automatically triggers Anti-Lag cleanup whenever your FPS drops below the threshold.")
 AntiPerfBox:AddToggle("AutoAntiLag", {
 	Text = "Auto Anti Lag",
 	Default = false,
 })
 
+RegisterTooltip("Auto Anti-Lag FPS", "FPS threshold that triggers Auto Anti-Lag.")
 AntiPerfBox:AddSlider("AutoAntiLagFPS", {
 	Text = "Auto Anti-Lag FPS",
 	Default = 35,
@@ -889,6 +1044,7 @@ AntiPerfBox:AddSlider("AutoAntiLagFPS", {
 	Rounding = 0,
 })
 
+RegisterTooltip("Anti Invis", "Forces invisible player characters back to visible transparency.")
 AntiPerfBox:AddToggle("AntiInvis", {
 	Text = "Anti Invis",
 	Default = false,
@@ -900,6 +1056,7 @@ AntiPerfBox:AddToggle("AntiInvis", {
 local PlankBox = Tabs.ToysWorld:AddLeftGroupbox("Wood Plank & Toy Spawner")
 local WorldActionsBox = Tabs.ToysWorld:AddRightGroupbox("Bombs, Coins & Slots")
 
+RegisterTooltip("Spawn Wood Plank", "Activates the Lincoln PlankMaker button and spawns a PalletLightBrown at your camera.")
 PlankBox:AddButton({
 	Text = "Spawn Wood Plank",
 	Func = function()
@@ -907,6 +1064,7 @@ PlankBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Select Toy", "Choose any toy from the game's MenuToysData catalog.")
 PlankBox:AddDropdown("SelectedToyDropdown", {
 	Values = AllToyNames,
 	Default = "PalletLightBrown",
@@ -915,6 +1073,7 @@ PlankBox:AddDropdown("SelectedToyDropdown", {
 	Text = "Select Toy",
 })
 
+RegisterTooltip("Spawn Selected Toy", "Spawns the selected toy right in front of your camera.")
 PlankBox:AddButton({
 	Text = "Spawn Selected Toy",
 	Func = function()
@@ -930,6 +1089,7 @@ PlankBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Buy Selected Toy", "Purchases the selected toy from the shop using your in-game coins.")
 PlankBox:AddButton({
 	Text = "Buy Selected Toy",
 	Func = function()
@@ -942,6 +1102,7 @@ PlankBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Claim All Free Toys", "Automatically claims all 0-coin toys (Boombox, FireExtinguisher, Mayonnaise, Ocarina, PresentSmall, SprayCanWD).")
 PlankBox:AddButton({
 	Text = "Claim All Free Toys",
 	Func = function()
@@ -963,6 +1124,7 @@ PlankBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Destroy All My Toys", "Destroys all toys currently inside your SpawnedInToys folder to free up toy points.")
 PlankBox:AddButton({
 	Text = "Destroy All My Toys",
 	Func = function()
@@ -980,6 +1142,7 @@ PlankBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Detonate All Bombs", "Remotely detonates all active bombs, balloons, and presents tracked in ExplosionMaker.")
 WorldActionsBox:AddButton({
 	Text = "Detonate All Bombs",
 	Func = function()
@@ -998,11 +1161,13 @@ WorldActionsBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Auto Collect Coins", "Automatically collects all Coin5, Coin10, and Coin25 drops across the map using firetouchinterest.")
 WorldActionsBox:AddToggle("AutoCollectCoins", {
 	Text = "Auto Collect Coins",
 	Default = false,
 })
 
+RegisterTooltip("Auto Spin Slots", "Automatically pulls the slot machine handles whenever their LightBall turns Neon.")
 WorldActionsBox:AddToggle("AutoSpinSlots", {
 	Text = "Auto Spin Slots",
 	Default = false,
@@ -1014,6 +1179,7 @@ WorldActionsBox:AddToggle("AutoSpinSlots", {
 local TeleportBox = Tabs.TeleportAura:AddLeftGroupbox("Teleport")
 local AuraBox = Tabs.TeleportAura:AddRightGroupbox("Grab Auras")
 
+RegisterTooltip("Teleport Up / Down Studs", "Sets the stud distance for the Teleport Up and Teleport Down buttons.")
 TeleportBox:AddSlider("VerticalTPDistance", {
 	Text = "Teleport Up / Down Studs",
 	Default = 40,
@@ -1022,6 +1188,7 @@ TeleportBox:AddSlider("VerticalTPDistance", {
 	Rounding = 0,
 })
 
+RegisterTooltip("Teleport Up", "Teleports you (and your grabbed target) straight up by the configured studs.")
 TeleportBox:AddButton({
 	Text = "Teleport Up",
 	Func = function()
@@ -1036,6 +1203,7 @@ TeleportBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Teleport Down", "Teleports you (and your grabbed target) straight down by the configured studs.")
 TeleportBox:AddButton({
 	Text = "Teleport Down",
 	Func = function()
@@ -1050,6 +1218,7 @@ TeleportBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Target Player", "Select a player to teleport to or orbit.")
 TeleportBox:AddDropdown("TargetPlayerDropdown", {
 	Values = GetPlayerNames(),
 	Default = 1,
@@ -1058,6 +1227,7 @@ TeleportBox:AddDropdown("TargetPlayerDropdown", {
 	Text = "Target Player",
 })
 
+RegisterTooltip("Refresh Players", "Updates the Target Player dropdown with current server players.")
 TeleportBox:AddButton({
 	Text = "Refresh Players",
 	Func = function()
@@ -1067,6 +1237,7 @@ TeleportBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Teleport To Player", "Instantly teleports your character behind the selected player.")
 TeleportBox:AddButton({
 	Text = "Teleport To Player",
 	Func = function()
@@ -1080,11 +1251,13 @@ TeleportBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Loop TP", "Continuously teleports you to the selected target player or waypoint every frame.")
 TeleportBox:AddToggle("LoopTP", {
 	Text = "Loop TP",
 	Default = false,
 })
 
+RegisterTooltip("Loop TP Mode", "Choose how Loop TP positions your character relative to the target.")
 TeleportBox:AddDropdown("LoopTPMode", {
 	Values = { "Behind Target Player", "Above Target Player", "Orbit Target Player", "Selected Waypoint" },
 	Default = 1,
@@ -1092,6 +1265,7 @@ TeleportBox:AddDropdown("LoopTPMode", {
 	Text = "Loop TP Mode",
 })
 
+RegisterTooltip("Waypoint", "Select a map landmark or house plot to teleport to.")
 TeleportBox:AddDropdown("WaypointDropdown", {
 	Values = {
 		"Spawn",
@@ -1115,6 +1289,7 @@ TeleportBox:AddDropdown("WaypointDropdown", {
 	Text = "Waypoint",
 })
 
+RegisterTooltip("Teleport To Waypoint", "Teleports your character to the selected map waypoint or plot.")
 TeleportBox:AddButton({
 	Text = "Teleport To Waypoint",
 	Func = function()
@@ -1145,11 +1320,13 @@ TeleportBox:AddButton({
 	end,
 })
 
+RegisterTooltip("Grab Aura", "Automatically claims network ownership and launches nearby players within the Aura Radius.")
 AuraBox:AddToggle("GrabAura", {
 	Text = "Grab Aura",
 	Default = false,
 })
 
+RegisterTooltip("Aura Mode", "Select what Grab Aura does to players who enter your radius.")
 AuraBox:AddDropdown("GrabAuraMode", {
 	Values = { "Fling Away", "Void / Kill", "Sky Launch" },
 	Default = 1,
@@ -1157,6 +1334,7 @@ AuraBox:AddDropdown("GrabAuraMode", {
 	Text = "Aura Mode",
 })
 
+RegisterTooltip("Aura Radius", "Sets the stud radius around your character for Grab Aura.")
 AuraBox:AddSlider("GrabAuraRadius", {
 	Text = "Aura Radius",
 	Default = 25,
@@ -1182,6 +1360,7 @@ local DiagLabels = {
 	WorldCounts = DiagWorldBox:AddLabel("PCLDs: 0 | Active Bombs: 0"),
 }
 
+RegisterTooltip("Highlight PCLD Parts", "Highlights all 29 PlayerCharacterLocationDetector anti-cheat zones in red.")
 DiagWorldBox:AddToggle("PCLDESP", {
 	Text = "Highlight PCLD Parts",
 	Default = false,
@@ -1200,6 +1379,7 @@ DiagWorldBox:AddToggle("PCLDESP", {
 	end,
 })
 
+RegisterTooltip("Copy Diagnostic Snapshot", "Copies the current live diagnostic values to your clipboard.")
 DiagWorldBox:AddButton({
 	Text = "Copy Diagnostic Snapshot",
 	Func = function()
@@ -1224,6 +1404,7 @@ DiagWorldBox:AddButton({
 -- TAB 6: UI SETTINGS
 -- ----------------------------------------------------------------------------
 local MenuGroup = Tabs.UISettings:AddLeftGroupbox("Menu")
+RegisterTooltip("Open Keybind Menu", "Shows or hides the active keybinds overlay list.")
 MenuGroup:AddToggle("KeybindMenuOpen", {
 	Default = Library.KeybindFrame.Visible,
 	Text = "Open Keybind Menu",
@@ -1231,13 +1412,17 @@ MenuGroup:AddToggle("KeybindMenuOpen", {
 		Library.KeybindFrame.Visible = value
 	end,
 })
-MenuGroup:AddButton("Unload", function()
-	if Env.FTAP_Obsidian_Cleanup then
-		Env.FTAP_Obsidian_Cleanup()
-	end
-end)
+RegisterTooltip("Unload", "Cleanly unloads the script, restores hooks, and removes all UI elements.")
+MenuGroup:AddButton({
+	Text = "Unload",
+	Func = function()
+		if Env.FTAP_Obsidian_Cleanup then
+			Env.FTAP_Obsidian_Cleanup()
+		end
+	end,
+})
 MenuGroup:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {
-	Default = "RightShift",
+	Default = "RightControl",
 	NoUI = true,
 	Text = "Menu keybind",
 })
@@ -1252,12 +1437,56 @@ SaveManager:SetFolder("FTAP_Obsidian/main")
 SaveManager:BuildConfigSection(Tabs.UISettings)
 ThemeManager:ApplyToTab(Tabs.UISettings)
 
+-- Build Persistent Hover Target Cache from Obsidian's ScreenGui
+task.spawn(function()
+	task.wait(0.3)
+	local libGui = Library.ScreenGui
+	if not libGui then
+		return
+	end
+	local seenFrames: { [GuiObject]: boolean } = {}
+	for _, inst in ipairs(libGui:GetDescendants()) do
+		if (inst:IsA("TextLabel") or inst:IsA("TextButton")) and TooltipByText[inst.Text] then
+			local rowFrame = if inst:IsA("TextButton") then inst else (inst.Parent :: GuiObject?)
+			if rowFrame and rowFrame:IsA("GuiObject") and not seenFrames[rowFrame] then
+				seenFrames[rowFrame] = true
+				table.insert(HoverTargets, {
+					Frame = rowFrame,
+					Title = inst.Text,
+					Tip = TooltipByText[inst.Text],
+				})
+			end
+		end
+	end
+end)
+
+local function IsGuiObjectActuallyVisible(obj: GuiObject): boolean
+	local cur: Instance? = obj
+	while cur do
+		if cur:IsA("GuiObject") then
+			if not cur.Visible then
+				return false
+			end
+		elseif cur:IsA("ScreenGui") then
+			return cur.Enabled
+		end
+		cur = cur.Parent
+	end
+	return false
+end
+
 -- ============================================================================
 -- RUNTIME LISTENERS & LOOPS
 -- ============================================================================
 
 AddConnection(LocalPlayer.CharacterAdded:Connect(function(newChar)
-	task.wait(0.5)
+	task.spawn(function()
+		local stopVel = newChar:WaitForChild("StopVelocity", 3)
+		if stopVel then
+			UpdateStopVelocityProtection(newChar)
+		end
+	end)
+	task.wait(0.4)
 	UpdateStopVelocityProtection(newChar)
 	if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value then
 		local reach = (Options.CustomReachSlider and Options.CustomReachSlider.Value) or 30
@@ -1269,10 +1498,41 @@ UpdateStopVelocityProtection(GetCharacter())
 AddConnection(Workspace.DescendantAdded:Connect(function(inst)
 	if inst:IsA("BasePart") then
 		ApplySinglePartProtection(inst)
+	elseif inst.Name == "GrabParts" and inst.Parent ~= Workspace then
+		if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value) then
+			task.defer(function()
+				BreakEnemyGrabOnMe(inst)
+			end)
+		end
+	elseif inst.Name == "WeldConstraint" and inst.Parent and inst.Parent.Name == "GrabPart" then
+		local gpModel = inst.Parent.Parent
+		if gpModel and gpModel.Name == "GrabParts" and gpModel.Parent ~= Workspace then
+			if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value) then
+				task.defer(function()
+					BreakEnemyGrabOnMe(gpModel)
+				end)
+			end
+		end
 	elseif inst.Name == "MushroomPoisonEffects" and Toggles.AntiPoison and Toggles.AntiPoison.Value then
 		task.defer(function()
 			inst:Destroy()
 		end)
+	end
+end))
+
+-- Smooth Scroll Support for Free Further Reach (Pure Luau, Crash-Free)
+AddConnection(UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseWheel then
+		if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value and Workspace:FindFirstChild("GrabParts") then
+			local maxReach = (Options.CustomReachSlider and Options.CustomReachSlider.Value) or 30
+			CustomGrabDistance = math.clamp(CustomGrabDistance + (input.Position.Z * 3), 3, maxReach)
+			pcall(function()
+				ExtendGrabLine:FireServer(CustomGrabDistance)
+			end)
+		end
 	end
 end))
 
@@ -1290,13 +1550,15 @@ AddConnection(Workspace.ChildAdded:Connect(function(child)
 			local target = weld.Part1
 			ActiveGrabTarget = target
 
-			if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value and target then
-				local cam = Workspace.CurrentCamera
-				if cam then
-					local maxReach = (Options.CustomReachSlider and Options.CustomReachSlider.Value) or 30
-					local dist = math.clamp((target.Position - cam.CFrame.Position).Magnitude, 3, maxReach)
+			local cam = Workspace.CurrentCamera
+			if cam and target then
+				local maxReach = if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value
+					then ((Options.CustomReachSlider and Options.CustomReachSlider.Value) or 30)
+					else 20
+				CustomGrabDistance = math.clamp((target.Position - cam.CFrame.Position).Magnitude, 3, maxReach)
+				if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value then
 					pcall(function()
-						ExtendGrabLine:FireServer(dist)
+						ExtendGrabLine:FireServer(CustomGrabDistance)
 					end)
 				end
 			end
@@ -1372,19 +1634,14 @@ if IsHeldValue then
 			end
 			if Toggles.AntiGrab and Toggles.AntiGrab.Value then
 				local root = GetRootPart()
-				local savedCF = root and root.CFrame
+				local restoreCF = LastUnheldCFrame or (root and root.CFrame)
 				for _ = 1, 5 do
 					Struggle:FireServer()
 				end
-				if root and savedCF then
-					root.Anchored = true
+				if root and restoreCF then
 					root.AssemblyLinearVelocity = Vector3.zero
-					root.CFrame = savedCF
-					task.delay(0.06, function()
-						if root then
-							root.Anchored = false
-						end
-					end)
+					root.AssemblyAngularVelocity = Vector3.zero
+					root.CFrame = restoreCF
 				end
 			end
 		end
@@ -1401,13 +1658,55 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 		cam.FieldOfView = Options.CameraFOV.Value
 	end
 
+	local mousePos = UserInputService:GetMouseLocation()
+
+	-- Persistent Hover Tooltip Check
+	local foundHover: { Frame: GuiObject, Title: string, Tip: string }? = nil
+	if not Library.Unloaded and #HoverTargets > 0 then
+		local guiInset = GuiService:GetGuiInset()
+		for _, entry in ipairs(HoverTargets) do
+			local frame = entry.Frame
+			if frame and frame.Parent and IsGuiObjectActuallyVisible(frame) then
+				local screenGui = frame:FindFirstAncestorOfClass("ScreenGui")
+				local checkPos = if screenGui and not screenGui.IgnoreGuiInset then (mousePos - guiInset) else mousePos
+				local absPos = frame.AbsolutePosition
+				local absSize = frame.AbsoluteSize
+				if checkPos.X >= absPos.X and checkPos.X <= (absPos.X + absSize.X) and checkPos.Y >= absPos.Y and checkPos.Y <= (absPos.Y + absSize.Y) then
+					local scrollParent = frame:FindFirstAncestorWhichIsA("ScrollingFrame")
+					if scrollParent then
+						local sPos = scrollParent.AbsolutePosition
+						local sSize = scrollParent.AbsoluteSize
+						if checkPos.X >= sPos.X and checkPos.X <= (sPos.X + sSize.X) and checkPos.Y >= sPos.Y and checkPos.Y <= (sPos.Y + sSize.Y) then
+							foundHover = entry
+							break
+						end
+					else
+						foundHover = entry
+						break
+					end
+				end
+			end
+		end
+	end
+
+	if foundHover then
+		HoverTitleLabel.Text = foundHover.Title
+		HoverDescLabel.Text = foundHover.Tip
+		local vpSize = if cam then cam.ViewportSize else Vector2.new(1920, 1080)
+		local tipX = math.min(mousePos.X + 18, vpSize.X - 280)
+		local tipY = math.min(mousePos.Y + 18, vpSize.Y - 70)
+		HoverTooltipFrame.Position = UDim2.fromOffset(tipX, tipY)
+		HoverTooltipFrame.Visible = true
+	else
+		HoverTooltipFrame.Visible = false
+	end
+
 	local char = GetCharacter()
 	local root = GetRootPart()
 	local hum = GetHumanoid()
 
 	-- Silent Aim FOV Circle & Red/Green Target Highlight
 	if Toggles.SilentAimGrab and Toggles.SilentAimGrab.Value then
-		local mousePos = UserInputService:GetMouseLocation()
 		FOVCircleFrame.Position = UDim2.fromOffset(mousePos.X, mousePos.Y)
 		FOVCircleFrame.Visible = (not Toggles.ShowSilentAimCircle) or Toggles.ShowSilentAimCircle.Value
 
@@ -1444,10 +1743,10 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 		TargetHighlight.Enabled = false
 	end
 
-	-- Sync Gucci Anti-Grab Vehicle
+	-- Sync Gucci Anti-Grab Vehicle safely at Root CFrame (Not underground!)
 	if Toggles.GucciAntiGrab and Toggles.GucciAntiGrab.Value and GucciVehicle and GucciVehicle.Parent and root then
 		pcall(function()
-			GucciVehicle:PivotTo(root.CFrame * CFrame.new(0, -15, 0))
+			GucciVehicle:PivotTo(root.CFrame)
 			for _, p in ipairs(GucciVehicle:GetDescendants()) do
 				if p:IsA("BasePart") then
 					p.AssemblyLinearVelocity = Vector3.zero
@@ -1469,15 +1768,34 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
+	-- Instant Frame-Perfect Enemy Grab Weld Breaker (Prevents being pulled back)
+	local brokeWeldThisFrame = false
+	if char and ((Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value)) then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= LocalPlayer and plr.Character then
+				local theirGrab = plr.Character:FindFirstChild("GrabParts")
+				if theirGrab and BreakEnemyGrabOnMe(theirGrab) then
+					brokeWeldThisFrame = true
+				end
+			end
+		end
+	end
+
 	local isHeld = IsHeldValue and IsHeldValue.Value
 	local head = char and char:FindFirstChild("Head")
 	local partOwner = head and head:FindFirstChild("PartOwner")
 
-	if isHeld or partOwner then
+	if not isHeld and not partOwner and not brokeWeldThisFrame and root then
+		LastUnheldCFrame = root.CFrame
+	end
+
+	if isHeld or partOwner or brokeWeldThisFrame then
 		if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value) then
 			Struggle:FireServer()
 			if hum then
 				hum.Sit = false
+				hum.AutoRotate = true
+				hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 				local ragVal = hum:FindFirstChild("Ragdolled")
 				if ragVal and ragVal:IsA("BoolValue") then
 					ragVal.Value = false
@@ -1491,6 +1809,9 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 			if root then
 				root.AssemblyLinearVelocity = Vector3.zero
 				root.AssemblyAngularVelocity = Vector3.zero
+				if LastUnheldCFrame and (root.Position - LastUnheldCFrame.Position).Magnitude > 4 then
+					root.CFrame = LastUnheldCFrame
+				end
 				if Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value and cam then
 					SetNetworkOwner:FireServer(root, cam.CFrame)
 				end
@@ -1501,11 +1822,15 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
-	-- Active Grab Modifiers (Restored Working Spin Grab + Sky, Chaos, Noclip)
+	-- Active Grab Modifiers (Custom Reach Position + Spin + Sky + Chaos + Noclip)
 	local grabParts = Workspace:FindFirstChild("GrabParts")
 	if grabParts and ActiveGrabTarget and ActiveGrabTarget.Parent then
 		local dragPart = grabParts:FindFirstChild("DragPart") :: BasePart?
 		local orientPart = Workspace:FindFirstChild("RotateOrientPart") :: BasePart?
+
+		if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value and dragPart and cam then
+			dragPart.Position = cam.CFrame.Position + (cam.CFrame.LookVector * CustomGrabDistance)
+		end
 
 		if Toggles.SpinGrab and Toggles.SpinGrab.Value then
 			local speed = (Options.SpinGrabSpeed and Options.SpinGrabSpeed.Value) or 15
@@ -1588,22 +1913,6 @@ task.spawn(function()
 			local minFPS = (Options.AutoAntiLagFPS and Options.AutoAntiLagFPS.Value) or 35
 			if FPSCounter < minFPS then
 				RunAntiLagCleanup()
-			end
-		end
-
-		if char and ((Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value)) then
-			for _, plr in ipairs(Players:GetPlayers()) do
-				if plr ~= LocalPlayer and plr.Character then
-					local theirGrab = plr.Character:FindFirstChild("GrabParts")
-					if theirGrab then
-						local gp = theirGrab:FindFirstChild("GrabPart")
-						local wc = gp and gp:FindFirstChild("WeldConstraint")
-						if wc and wc.Part1 and wc.Part1:IsDescendantOf(char) then
-							wc.Part1 = nil
-							theirGrab:Destroy()
-						end
-					end
-				end
 			end
 		end
 
@@ -1790,14 +2099,6 @@ Env.FTAP_Obsidian_Cleanup = function()
 		end
 	end
 	table.clear(PCLDHighlights)
-
-	local char = GetCharacter()
-	if char then
-		local stopVel = char:FindFirstChild("StopVelocity")
-		if stopVel and stopVel:IsA("LocalScript") then
-			stopVel.Disabled = false
-		end
-	end
 
 	pcall(function()
 		Library:Unload()
