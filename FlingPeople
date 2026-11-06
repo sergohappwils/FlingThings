@@ -44,10 +44,6 @@ local CharacterEvents = ReplicatedStorage:WaitForChild("CharacterEvents")
 local Struggle = CharacterEvents:WaitForChild("Struggle")
 local RagdollRemote = CharacterEvents:FindFirstChild("RagdollRemote")
 
-local GameCorrectionEvents = ReplicatedStorage:FindFirstChild("GameCorrectionEvents")
-local TeleportToGround = GameCorrectionEvents and GameCorrectionEvents:FindFirstChild("TeleportToGround")
-local StopAllVelocity = GameCorrectionEvents and GameCorrectionEvents:FindFirstChild("StopAllVelocity")
-
 local MenuToys = ReplicatedStorage:WaitForChild("MenuToys")
 local SpawnToyRF = MenuToys:WaitForChild("SpawnToyRemoteFunction")
 local BuyToyRF = MenuToys:WaitForChild("BuyToyRemoteFunction")
@@ -73,7 +69,6 @@ local OriginalExplodeFn = ExplosionMaker.Explode
 local OriginalRaycastFn = RaycastModule.RaycastFromCam
 
 local LastSafeCFrame: CFrame? = nil
-local LastUnheldCFrame: CFrame? = nil
 local ActiveGrabTarget: BasePart? = nil
 local CustomGrabDistance: number = 20
 local SilentAimCandidate: BasePart? = nil
@@ -123,6 +118,21 @@ local function GetPlayerNames(): { string }
 		table.insert(list, LocalPlayer.Name)
 	end
 	return list
+end
+
+local function IsSafeMovablePart(part: BasePart?): boolean
+	if not part or not part.Parent or part.Anchored then
+		return false
+	end
+	local mapModel = Workspace:FindFirstChild("Map")
+	if mapModel and part:IsDescendantOf(mapModel) then
+		return false
+	end
+	local plotsFolder = Workspace:FindFirstChild("Plots")
+	if plotsFolder and part:IsDescendantOf(plotsFolder) then
+		return false
+	end
+	return true
 end
 
 local AllToyNames = MenuToysData.GetAllToysSortedByName()
@@ -331,7 +341,7 @@ RaycastModule.RaycastFromCam = function(player, reach)
 end
 
 -- ============================================================================
--- HAZARD CACHE & ANTI-PULLBACK / ANTI-KICK FUNCTIONS
+-- HAZARD CACHE & PROTECTION FUNCTIONS
 -- ============================================================================
 local function ApplySinglePartProtection(part: BasePart)
 	local name = part.Name
@@ -362,14 +372,11 @@ local function ApplySinglePartProtection(part: BasePart)
 			part.CanQuery = false
 			part.CanCollide = false
 		end
-	elseif name == "PlotBarrier" or name == "PlotArea" then
+	elseif name == "PlotBarrier" then
 		HazardCache.PlotBarrier[part] = true
 		if Toggles.AntiPlotBarrier and Toggles.AntiPlotBarrier.Value then
-			if name == "PlotBarrier" then
-				part.CanCollide = false
-			end
+			part.CanCollide = false
 			part.CanTouch = false
-			part.CanQuery = false
 		end
 	elseif name == "LeftDetector" or name == "RightDetector" then
 		if parent and parent.Name == "CreatureBlobman" then
@@ -416,8 +423,7 @@ local function SetCategoryPartsState(category: string, disableTouch: boolean, di
 	for part in pairs(bucket) do
 		if part and part.Parent then
 			part.CanTouch = not disableTouch
-			part.CanQuery = not disableTouch
-			if disableCollide ~= nil and part.Name ~= "PlotArea" then
+			if disableCollide ~= nil then
 				part.CanCollide = not disableCollide
 			end
 		else
@@ -448,72 +454,22 @@ ExplosionMaker.Explode = function(bombTable, pos)
 	return OriginalExplodeFn(bombTable, pos)
 end
 
--- Permanently neutralizes StopVelocity & TeleportToGround rubber-banding
 local function UpdateStopVelocityProtection(char: Model?)
-	local shouldProtect = (Toggles.AntiKick and Toggles.AntiKick.Value) or (Toggles.AntiGrab and Toggles.AntiGrab.Value)
-
-	if shouldProtect and getconnections then
-		pcall(function()
-			if TeleportToGround then
-				for _, conn in ipairs(getconnections(TeleportToGround.OnClientEvent)) do
-					if conn.Disable then
-						conn:Disable()
-					elseif conn.Disconnect then
-						conn:Disconnect()
-					end
-				end
-			end
-			if StopAllVelocity then
-				for _, conn in ipairs(getconnections(StopAllVelocity.OnClientEvent)) do
-					if conn.Disable then
-						conn:Disable()
-					elseif conn.Disconnect then
-						conn:Disconnect()
-					end
-				end
-			end
-		end)
-	end
-
 	if not char then
 		return
 	end
-
 	local stopVelScript = char:FindFirstChild("StopVelocity")
 	if stopVelScript and stopVelScript:IsA("LocalScript") then
-		if shouldProtect then
-			stopVelScript.Disabled = true
-			pcall(function()
-				stopVelScript:Destroy()
-			end)
-		end
+		local shouldDisable = (Toggles.AntiKick and Toggles.AntiKick.Value) or (Toggles.AntiGrab and Toggles.AntiGrab.Value)
+		stopVelScript.Disabled = if shouldDisable then true else false
 	end
-
 	local poisonScript = char:FindFirstChild("PoisonBallSpawner")
 	if poisonScript and poisonScript:IsA("LocalScript") and Toggles.AntiPoison and Toggles.AntiPoison.Value then
 		poisonScript.Disabled = true
 	end
 end
 
--- Breaks enemy GrabParts welds before they can pull LocalPlayer backward
-local function BreakEnemyGrabOnMe(grabPartsModel: Instance)
-	local char = GetCharacter()
-	if not char or not grabPartsModel or grabPartsModel.Parent == Workspace then
-		return false
-	end
-	local gp = grabPartsModel:FindFirstChild("GrabPart")
-	local wc = gp and gp:FindFirstChild("WeldConstraint") :: WeldConstraint?
-	if wc and wc.Part1 and wc.Part1:IsDescendantOf(char) then
-		wc.Enabled = false
-		wc.Part1 = nil
-		pcall(function()
-			grabPartsModel:Destroy()
-		end)
-		return true
-	end
-	return false
-end
-
+-- 100% Pure Luau Reach Update (Zero getconnections / debug.setupvalue crashes)
 local function ApplyCustomReach(reachStuds: number)
 	local currentReachVal = LocalPlayer:FindFirstChild("CurrentReach")
 	local defaultReachVal = LocalPlayer:FindFirstChild("DefaultReach")
@@ -592,16 +548,7 @@ local function EnableGucciAntiGrab(mode: string)
 				SpawnToyRF:InvokeServer(toyName, root.CFrame, orientVec)
 			end)
 			if toysFolder then
-				vehicleModel = toysFolder:WaitForChild(toyName, 1.5)
-			end
-		end
-
-		-- Fallback to map's free Farm.TractorGreen if player doesn't own the toy
-		if not vehicleModel then
-			local farmFolder = Workspace:FindFirstChild("Farm")
-			local freeTractor = farmFolder and farmFolder:FindFirstChild("TractorGreen")
-			if freeTractor then
-				vehicleModel = freeTractor
+				vehicleModel = toysFolder:WaitForChild(toyName, 3)
 			end
 		end
 
@@ -619,11 +566,11 @@ local function EnableGucciAntiGrab(mode: string)
 					end
 				end
 				vSeat:Sit(hum)
-				task.wait(0.1)
+				task.wait(0.12)
 				if RagdollRemote then
 					RagdollRemote:FireServer(root, 0)
 				end
-				task.wait(0.06)
+				task.wait(0.08)
 				local seatWeld = vSeat:FindFirstChild("SeatWeld")
 				if seatWeld then
 					seatWeld:Destroy()
@@ -783,7 +730,7 @@ GrabModifiersBox:AddToggle("SupersonicGrab", {
 	Default = false,
 })
 
-RegisterTooltip("Spin Grab", "Rapidly spins the grabbed player or object while holding them.")
+RegisterTooltip("Spin Grab", "Rapidly spins the grabbed player or unanchored toy while holding them (ignores baseplate/anchored parts).")
 GrabModifiersBox:AddToggle("SpinGrab", {
 	Text = "Spin Grab",
 	Default = false,
@@ -863,7 +810,7 @@ local AntiGrabBox = Tabs.Defense:AddLeftGroupbox("Anti-Grab & Ownership")
 local AntiHazardBox = Tabs.Defense:AddRightGroupbox("Anti-Kick & Hazards")
 local AntiPerfBox = Tabs.Defense:AddLeftGroupbox("Anti-Lag & Visibility")
 
-RegisterTooltip("Anti Grab", "Instantly breaks enemy grab welds, spams Struggle, unragdolls you, and prevents being pulled back.")
+RegisterTooltip("Anti Grab", "Automatically spams Struggle, unragdolls your character, and breaks enemy GrabParts welded to you.")
 AntiGrabBox:AddToggle("AntiGrab", {
 	Text = "Anti Grab",
 	Default = false,
@@ -872,7 +819,7 @@ AntiGrabBox:AddToggle("AntiGrab", {
 	end,
 })
 
-RegisterTooltip("[GUCCHI] Anti Grab", "Desyncs your seat weld using Blobman or Tractor so other players cannot grab you.")
+RegisterTooltip("[GUCCHI] Anti Grab", "Spawns an invisible vehicle (Blobman or Tractor) and desyncs your seat weld so players cannot grab you.")
 AntiGrabBox:AddToggle("GucciAntiGrab", {
 	Text = "[GUCCHI] Anti Grab",
 	Default = false,
@@ -891,7 +838,7 @@ AntiGrabBox:AddToggle("GucciAntiGrab", {
 	end,
 })
 
-RegisterTooltip("Gucci Vehicle Mode", "Select which vehicle is used for [GUCCHI] Anti Grab (falls back to Farm Tractor if unowned).")
+RegisterTooltip("Gucci Vehicle Mode", "Select which toy vehicle is used for [GUCCHI] Anti Grab.")
 AntiGrabBox:AddDropdown("GucciMode", {
 	Values = { "CreatureBlobman", "TractorGreen" },
 	Default = 1,
@@ -920,7 +867,7 @@ AntiGrabBox:AddToggle("AutoReset", {
 	Default = false,
 })
 
-RegisterTooltip("Anti Kick", "Destroys the StopVelocity script and disconnects TeleportToGround so the server cannot rubber-band you back.")
+RegisterTooltip("Anti Kick", "Disables the local StopVelocity script and breaks enemy grab welds.")
 AntiHazardBox:AddToggle("AntiKick", {
 	Text = "Anti Kick",
 	Default = false,
@@ -929,7 +876,7 @@ AntiHazardBox:AddToggle("AntiKick", {
 	end,
 })
 
-RegisterTooltip("Anti Plot Barrier", "Disables PlotBarrier collisions and PlotArea touch detection so you can walk freely into any house plot.")
+RegisterTooltip("Anti Plot Barrier", "Allows you to walk through plot barriers even if you are not added to the plot.")
 AntiHazardBox:AddToggle("AntiPlotBarrier", {
 	Text = "Anti Plot Barrier",
 	Default = false,
@@ -1000,7 +947,7 @@ AntiHazardBox:AddToggle("AntiBanana", {
 })
 
 RegisterTooltip("Anti Paint", "Disables PaintPlayerPart hitboxes on paint buckets, hot sauce, UFOs, and tesla coils.")
-AntiHazardBox:AddToggle("Anti Paint", {
+AntiHazardBox:AddToggle("AntiPaint", {
 	Text = "Anti Paint",
 	Default = false,
 	Callback = function(val)
@@ -1193,7 +1140,7 @@ TeleportBox:AddButton({
 	Text = "Teleport Up",
 	Func = function()
 		local dist = (Options.VerticalTPDistance and Options.VerticalTPDistance.Value) or 40
-		if ActiveGrabTarget and ActiveGrabTarget.Parent then
+		if IsSafeMovablePart(ActiveGrabTarget) then
 			ActiveGrabTarget.CFrame += Vector3.new(0, dist, 0)
 		end
 		local root = GetRootPart()
@@ -1208,7 +1155,7 @@ TeleportBox:AddButton({
 	Text = "Teleport Down",
 	Func = function()
 		local dist = (Options.VerticalTPDistance and Options.VerticalTPDistance.Value) or 40
-		if ActiveGrabTarget and ActiveGrabTarget.Parent then
+		if IsSafeMovablePart(ActiveGrabTarget) then
 			ActiveGrabTarget.CFrame -= Vector3.new(0, dist, 0)
 		end
 		local root = GetRootPart()
@@ -1480,13 +1427,7 @@ end
 -- ============================================================================
 
 AddConnection(LocalPlayer.CharacterAdded:Connect(function(newChar)
-	task.spawn(function()
-		local stopVel = newChar:WaitForChild("StopVelocity", 3)
-		if stopVel then
-			UpdateStopVelocityProtection(newChar)
-		end
-	end)
-	task.wait(0.4)
+	task.wait(0.5)
 	UpdateStopVelocityProtection(newChar)
 	if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value then
 		local reach = (Options.CustomReachSlider and Options.CustomReachSlider.Value) or 30
@@ -1498,21 +1439,6 @@ UpdateStopVelocityProtection(GetCharacter())
 AddConnection(Workspace.DescendantAdded:Connect(function(inst)
 	if inst:IsA("BasePart") then
 		ApplySinglePartProtection(inst)
-	elseif inst.Name == "GrabParts" and inst.Parent ~= Workspace then
-		if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value) then
-			task.defer(function()
-				BreakEnemyGrabOnMe(inst)
-			end)
-		end
-	elseif inst.Name == "WeldConstraint" and inst.Parent and inst.Parent.Name == "GrabPart" then
-		local gpModel = inst.Parent.Parent
-		if gpModel and gpModel.Name == "GrabParts" and gpModel.Parent ~= Workspace then
-			if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value) then
-				task.defer(function()
-					BreakEnemyGrabOnMe(gpModel)
-				end)
-			end
-		end
 	elseif inst.Name == "MushroomPoisonEffects" and Toggles.AntiPoison and Toggles.AntiPoison.Value then
 		task.defer(function()
 			inst:Destroy()
@@ -1550,8 +1476,14 @@ AddConnection(Workspace.ChildAdded:Connect(function(child)
 			local target = weld.Part1
 			ActiveGrabTarget = target
 
+			-- Prevent baseplate / anchored map parts from ever getting velocity
+			if target and target.Anchored then
+				target.AssemblyLinearVelocity = Vector3.zero
+				target.AssemblyAngularVelocity = Vector3.zero
+			end
+
 			local cam = Workspace.CurrentCamera
-			if cam and target then
+			if cam and target and IsSafeMovablePart(target) then
 				local maxReach = if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value
 					then ((Options.CustomReachSlider and Options.CustomReachSlider.Value) or 30)
 					else 20
@@ -1563,7 +1495,7 @@ AddConnection(Workspace.ChildAdded:Connect(function(child)
 				end
 			end
 
-			if (Toggles.SupersonicGrab and Toggles.SupersonicGrab.Value) or (Toggles.SuperStrength and Toggles.SuperStrength.Value) then
+			if IsSafeMovablePart(target) and ((Toggles.SupersonicGrab and Toggles.SupersonicGrab.Value) or (Toggles.SuperStrength and Toggles.SuperStrength.Value)) then
 				local alignPos = dragPart:FindFirstChildOfClass("AlignPosition")
 				local alignOri = dragPart:FindFirstChildOfClass("AlignOrientation")
 				if alignPos then
@@ -1578,7 +1510,7 @@ AddConnection(Workspace.ChildAdded:Connect(function(child)
 				end
 			end
 
-			if Toggles.KillGrab and Toggles.KillGrab.Value and target then
+			if Toggles.KillGrab and Toggles.KillGrab.Value and IsSafeMovablePart(target) then
 				local model = target:FindFirstAncestorOfClass("Model")
 				local hum = model and model:FindFirstChildOfClass("Humanoid")
 				local hrp = model and model:FindFirstChild("HumanoidRootPart") :: BasePart?
@@ -1601,7 +1533,13 @@ AddConnection(Workspace.ChildRemoved:Connect(function(child)
 		local target = ActiveGrabTarget
 		ActiveGrabTarget = nil
 
-		if Toggles.SuperStrength and Toggles.SuperStrength.Value and target and target.Parent and not target.Anchored then
+		if target and target.Anchored then
+			target.AssemblyLinearVelocity = Vector3.zero
+			target.AssemblyAngularVelocity = Vector3.zero
+			return
+		end
+
+		if Toggles.SuperStrength and Toggles.SuperStrength.Value and IsSafeMovablePart(target) then
 			local power = (Options.StrengthPower and Options.StrengthPower.Value) or 850
 			local cam = Workspace.CurrentCamera
 			if cam then
@@ -1609,7 +1547,7 @@ AddConnection(Workspace.ChildRemoved:Connect(function(child)
 				local model = target:FindFirstAncestorOfClass("Model")
 				if model and model ~= Workspace then
 					for _, p in ipairs(model:GetDescendants()) do
-						if p:IsA("BasePart") then
+						if p:IsA("BasePart") and not p.Anchored then
 							p.AssemblyLinearVelocity = launchVel
 						end
 					end
@@ -1634,14 +1572,19 @@ if IsHeldValue then
 			end
 			if Toggles.AntiGrab and Toggles.AntiGrab.Value then
 				local root = GetRootPart()
-				local restoreCF = LastUnheldCFrame or (root and root.CFrame)
+				local savedCF = root and root.CFrame
 				for _ = 1, 5 do
 					Struggle:FireServer()
 				end
-				if root and restoreCF then
+				if root and savedCF then
+					root.Anchored = true
 					root.AssemblyLinearVelocity = Vector3.zero
-					root.AssemblyAngularVelocity = Vector3.zero
-					root.CFrame = restoreCF
+					root.CFrame = savedCF
+					task.delay(0.06, function()
+						if root then
+							root.Anchored = false
+						end
+					end)
 				end
 			end
 		end
@@ -1743,10 +1686,10 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 		TargetHighlight.Enabled = false
 	end
 
-	-- Sync Gucci Anti-Grab Vehicle safely at Root CFrame (Not underground!)
+	-- Sync Gucci Anti-Grab Vehicle
 	if Toggles.GucciAntiGrab and Toggles.GucciAntiGrab.Value and GucciVehicle and GucciVehicle.Parent and root then
 		pcall(function()
-			GucciVehicle:PivotTo(root.CFrame)
+			GucciVehicle:PivotTo(root.CFrame * CFrame.new(0, -15, 0))
 			for _, p in ipairs(GucciVehicle:GetDescendants()) do
 				if p:IsA("BasePart") then
 					p.AssemblyLinearVelocity = Vector3.zero
@@ -1768,34 +1711,15 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
-	-- Instant Frame-Perfect Enemy Grab Weld Breaker (Prevents being pulled back)
-	local brokeWeldThisFrame = false
-	if char and ((Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value)) then
-		for _, plr in ipairs(Players:GetPlayers()) do
-			if plr ~= LocalPlayer and plr.Character then
-				local theirGrab = plr.Character:FindFirstChild("GrabParts")
-				if theirGrab and BreakEnemyGrabOnMe(theirGrab) then
-					brokeWeldThisFrame = true
-				end
-			end
-		end
-	end
-
 	local isHeld = IsHeldValue and IsHeldValue.Value
 	local head = char and char:FindFirstChild("Head")
 	local partOwner = head and head:FindFirstChild("PartOwner")
 
-	if not isHeld and not partOwner and not brokeWeldThisFrame and root then
-		LastUnheldCFrame = root.CFrame
-	end
-
-	if isHeld or partOwner or brokeWeldThisFrame then
+	if isHeld or partOwner then
 		if (Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value) then
 			Struggle:FireServer()
 			if hum then
 				hum.Sit = false
-				hum.AutoRotate = true
-				hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
 				local ragVal = hum:FindFirstChild("Ragdolled")
 				if ragVal and ragVal:IsA("BoolValue") then
 					ragVal.Value = false
@@ -1809,9 +1733,6 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 			if root then
 				root.AssemblyLinearVelocity = Vector3.zero
 				root.AssemblyAngularVelocity = Vector3.zero
-				if LastUnheldCFrame and (root.Position - LastUnheldCFrame.Position).Magnitude > 4 then
-					root.CFrame = LastUnheldCFrame
-				end
 				if Toggles.AntiNetworkOwnership and Toggles.AntiNetworkOwnership.Value and cam then
 					SetNetworkOwner:FireServer(root, cam.CFrame)
 				end
@@ -1822,48 +1743,53 @@ AddConnection(RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
-	-- Active Grab Modifiers (Custom Reach Position + Spin + Sky + Chaos + Noclip)
+	-- Active Grab Modifiers (Strictly ignores Anchored / Baseplate / Map parts so you never get velocited!)
 	local grabParts = Workspace:FindFirstChild("GrabParts")
 	if grabParts and ActiveGrabTarget and ActiveGrabTarget.Parent then
-		local dragPart = grabParts:FindFirstChild("DragPart") :: BasePart?
-		local orientPart = Workspace:FindFirstChild("RotateOrientPart") :: BasePart?
+		if ActiveGrabTarget.Anchored then
+			ActiveGrabTarget.AssemblyLinearVelocity = Vector3.zero
+			ActiveGrabTarget.AssemblyAngularVelocity = Vector3.zero
+		elseif IsSafeMovablePart(ActiveGrabTarget) then
+			local dragPart = grabParts:FindFirstChild("DragPart") :: BasePart?
+			local orientPart = Workspace:FindFirstChild("RotateOrientPart") :: BasePart?
 
-		if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value and dragPart and cam then
-			dragPart.Position = cam.CFrame.Position + (cam.CFrame.LookVector * CustomGrabDistance)
-		end
-
-		if Toggles.SpinGrab and Toggles.SpinGrab.Value then
-			local speed = (Options.SpinGrabSpeed and Options.SpinGrabSpeed.Value) or 15
-			if orientPart then
-				orientPart.Orientation += Vector3.new(0, speed * 5, speed * 5)
+			if Toggles.FreeFurtherReach and Toggles.FreeFurtherReach.Value and dragPart and cam then
+				dragPart.Position = cam.CFrame.Position + (cam.CFrame.LookVector * CustomGrabDistance)
 			end
-			if dragPart then
-				local dragAttach = dragPart:FindFirstChild("DragAttach") :: Attachment?
-				if dragAttach then
-					dragAttach.Orientation += Vector3.new(0, speed * 5, speed * 5)
+
+			if Toggles.SpinGrab and Toggles.SpinGrab.Value then
+				local speed = (Options.SpinGrabSpeed and Options.SpinGrabSpeed.Value) or 15
+				if orientPart then
+					orientPart.Orientation += Vector3.new(0, speed * 5, speed * 5)
 				end
-			end
-			ActiveGrabTarget.AssemblyAngularVelocity = Vector3.new(0, speed * 10, 0)
-		end
-
-		if Toggles.SkyGrab and Toggles.SkyGrab.Value and dragPart then
-			dragPart.Position += Vector3.new(0, 350, 0)
-		end
-
-		if Toggles.ChaosGrab and Toggles.ChaosGrab.Value and dragPart then
-			dragPart.Position += Vector3.new(math.random(-35, 35), math.random(-20, 35), math.random(-35, 35))
-		end
-
-		if Toggles.NoclipGrab and Toggles.NoclipGrab.Value then
-			local model = ActiveGrabTarget:FindFirstAncestorOfClass("Model")
-			if model and model ~= Workspace then
-				for _, p in ipairs(model:GetDescendants()) do
-					if p:IsA("BasePart") then
-						p.CanCollide = false
+				if dragPart then
+					local dragAttach = dragPart:FindFirstChild("DragAttach") :: Attachment?
+					if dragAttach then
+						dragAttach.Orientation += Vector3.new(0, speed * 5, speed * 5)
 					end
 				end
-			else
-				ActiveGrabTarget.CanCollide = false
+				ActiveGrabTarget.AssemblyAngularVelocity = Vector3.new(0, speed * 10, 0)
+			end
+
+			if Toggles.SkyGrab and Toggles.SkyGrab.Value and dragPart then
+				dragPart.Position += Vector3.new(0, 350, 0)
+			end
+
+			if Toggles.ChaosGrab and Toggles.ChaosGrab.Value and dragPart then
+				dragPart.Position += Vector3.new(math.random(-35, 35), math.random(-20, 35), math.random(-35, 35))
+			end
+
+			if Toggles.NoclipGrab and Toggles.NoclipGrab.Value then
+				local model = ActiveGrabTarget:FindFirstAncestorOfClass("Model")
+				if model and model ~= Workspace then
+					for _, p in ipairs(model:GetDescendants()) do
+						if p:IsA("BasePart") and not p.Anchored then
+							p.CanCollide = false
+						end
+					end
+				else
+					ActiveGrabTarget.CanCollide = false
+				end
 			end
 		end
 	end
@@ -1913,6 +1839,22 @@ task.spawn(function()
 			local minFPS = (Options.AutoAntiLagFPS and Options.AutoAntiLagFPS.Value) or 35
 			if FPSCounter < minFPS then
 				RunAntiLagCleanup()
+			end
+		end
+
+		if char and ((Toggles.AntiGrab and Toggles.AntiGrab.Value) or (Toggles.AntiKick and Toggles.AntiKick.Value)) then
+			for _, plr in ipairs(Players:GetPlayers()) do
+				if plr ~= LocalPlayer and plr.Character then
+					local theirGrab = plr.Character:FindFirstChild("GrabParts")
+					if theirGrab then
+						local gp = theirGrab:FindFirstChild("GrabPart")
+						local wc = gp and gp:FindFirstChild("WeldConstraint")
+						if wc and wc.Part1 and wc.Part1:IsDescendantOf(char) then
+							wc.Part1 = nil
+							theirGrab:Destroy()
+						end
+					end
+				end
 			end
 		end
 
@@ -2099,6 +2041,14 @@ Env.FTAP_Obsidian_Cleanup = function()
 		end
 	end
 	table.clear(PCLDHighlights)
+
+	local char = GetCharacter()
+	if char then
+		local stopVel = char:FindFirstChild("StopVelocity")
+		if stopVel and stopVel:IsA("LocalScript") then
+			stopVel.Disabled = false
+		end
+	end
 
 	pcall(function()
 		Library:Unload()
